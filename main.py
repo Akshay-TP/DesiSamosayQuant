@@ -31,6 +31,7 @@ from strategy import build_targets
 
 load_dotenv()
 STOP = False
+LOG = logging.getLogger(__name__)
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -197,10 +198,14 @@ def record_prices(state: dict[str, Any], prices: dict[str, float]) -> None:
         history[pair] = points[-1000:]
 
 
-def nav_and_positions(wallet: dict[str, dict[str, Any]], prices: dict[str, float]) -> tuple[float, float, dict[str, float], float]:
+def nav_and_positions(
+    wallet: dict[str, dict[str, Any]], prices: dict[str, float], short_positions: list[dict[str, Any]],
+) -> tuple[float, float, dict[str, float], dict[str, float], dict[str, dict[str, Any]], float]:
     cash_free, cash_locked = wallet_amount(wallet, "USD")
     cash = cash_free + cash_locked
-    positions: dict[str, float] = {}
+    long_positions: dict[str, float] = {}
+    short_map: dict[str, dict[str, Any]] = {}
+    signed_positions: dict[str, float] = {}
     total = cash
     gross = 0.0
     for coin, pair in ((key.split("/")[0], key) for key in prices):
@@ -208,10 +213,25 @@ def nav_and_positions(wallet: dict[str, dict[str, Any]], prices: dict[str, float
         quantity = free + locked
         value = quantity * prices[pair]
         if quantity > 0:
-            positions[pair] = value
+            long_positions[pair] = value
+            signed_positions[pair] = value
             total += value
             gross += value
-    return total, cash_free, positions, gross
+    for position in short_positions:
+        pair = str(position.get("Pair", ""))
+        if not pair:
+            continue
+        qty = float(position.get("ShortQty", 0) or 0)
+        mark = float(prices.get(pair, position.get("CurrentPrice", 0)) or 0)
+        notional = qty * mark
+        if notional <= 0:
+            continue
+        short_map[pair] = {**position, "ShortQty": qty, "MarkPrice": mark, "Notional": notional}
+        signed_positions[pair] = signed_positions.get(pair, 0.0) - notional
+        # USD collateral is already included in wallet Free+Lock; add only unrealized PnL.
+        total += float(position.get("UnrealizedPNL", 0) or 0)
+        gross += notional
+    return total, cash_free, signed_positions, long_positions, short_map, gross
 
 
 def evaluate_risk(cfg: dict[str, Any], state: dict[str, Any], nav: float) -> tuple[float, float, bool]:
@@ -266,7 +286,8 @@ def current_wallet(client: RoostooClient) -> dict[str, dict[str, Any]]:
 def rebalance(
     cfg: dict[str, Any], state: dict[str, Any], client: RoostooClient,
     pairs: list[str], pair_info: dict[str, dict[str, Any]], market: dict[str, dict[str, Any]],
-    wallet: dict[str, dict[str, Any]], nav: float, cash_free: float, positions: dict[str, float],
+    wallet: dict[str, dict[str, Any]], nav: float, cash_free: float,
+    long_positions: dict[str, float], short_positions: dict[str, dict[str, Any]],
     targets: dict[str, float], halt_buys: bool,
 ) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
@@ -280,66 +301,110 @@ def rebalance(
     if halt_buys:
         targets = {}
 
-    orders: list[tuple[str, str, float, float]] = []
+    reductions: list[tuple[str, str, Any]] = []
     for pair in pairs:
         price = float(market.get(pair, {}).get("LastPrice", 0))
         if price <= 0:
             continue
-        current_value = positions.get(pair, 0.0)
-        desired_value = targets.get(pair, 0.0) * nav
-        delta = desired_value - current_value
+        target_weight = targets.get(pair, 0.0)
+        target_value = abs(target_weight) * nav
         minimum = max(cfg["min_trade_usd"], float(pair_info.get(pair, {}).get("MiniOrder", 1.0) or 1.0))
-        if abs(delta) < minimum:
-            continue
-        order_value = min(abs(delta), cfg["max_order_usd"])
-        orders.append((pair, "BUY" if delta > 0 else "SELL", order_value, price))
+        current_short = short_positions.get(pair)
+        short_value = float(current_short.get("Notional", 0) or 0) if current_short else 0.0
+        long_value = long_positions.get(pair, 0.0)
 
-    sells = [order for order in orders if order[1] == "SELL"]
-    buys = [order for order in orders if order[1] == "BUY"]
-    # Close/reduce first, then refresh cash before any buys.
-    for pair, side, value, price in sells:
-        coin = pair.split("/")[0]
-        free, _locked = wallet_amount(wallet, coin)
-        precision = int(pair_info.get(pair, {}).get("AmountPrecision", 6))
-        quantity = floor_quantity(min(free, value / price), precision)
-        if quantity <= 0 or float(quantity) * price < float(pair_info.get(pair, {}).get("MiniOrder", 1.0) or 1.0):
-            continue
-        event = execute_order(cfg, client, pair, side, quantity, {"nav": nav, "reason": "target_reduction"})
+        # Close the opposing side before building exposure in the target direction.
+        long_to_reduce = max(0.0, long_value - (target_value if target_weight > 0 else 0.0))
+        if long_to_reduce >= minimum:
+            coin = pair.split("/")[0]
+            free, _locked = wallet_amount(wallet, coin)
+            precision = int(pair_info.get(pair, {}).get("AmountPrecision", 6))
+            quantity = floor_quantity(min(free, long_to_reduce / price), precision)
+            if quantity > 0 and float(quantity) * price >= float(pair_info.get(pair, {}).get("MiniOrder", 1.0) or 1.0):
+                reductions.append(("sell_long", pair, quantity))
+
+        short_target = target_value if target_weight < 0 else 0.0
+        short_to_reduce = max(0.0, short_value - short_target)
+        if short_to_reduce >= minimum and current_short:
+            precision = int(pair_info.get(pair, {}).get("AmountPrecision", 6))
+            if short_target == 0:
+                close_qty = None  # API's omitted close_qty closes the position fully.
+            else:
+                close_qty = floor_quantity(short_to_reduce / price, precision)
+                if close_qty <= 0:
+                    continue
+            reductions.append(("close_short", pair, close_qty))
+
+    # Reduce and close existing risk first, then refresh account state before opening risk.
+    for action, pair, quantity in reductions:
+        event = (
+            execute_order(cfg, client, pair, "SELL", quantity, {"nav": nav, "reason": "target_reduction"})
+            if action == "sell_long"
+            else execute_short_close(cfg, client, pair, quantity, {"nav": nav, "reason": "target_reduction"})
+        )
         events.append(event)
         if not event.get("success"):
-            LOG.error("Stopping rebalance after an unsuccessful/uncertain order")
+            LOG.error("Stopping rebalance after an unsuccessful/uncertain reduction")
             return events
-        if event.get("success") and not cfg["dry_run"]:
-            try:
-                wallet = current_wallet(client)
-            except RoostooAPIError as exc:
-                LOG.error("Could not refresh wallet after sale; stopping this rebalance: %s", exc)
+
+    try:
+        wallet = current_wallet(client)
+        live_shorts = client.short_positions()
+    except RoostooAPIError as exc:
+        LOG.error("Could not reconcile positions after reductions; stopping rebalance: %s", exc)
+        return events
+    cash_free, _ = wallet_amount(wallet, "USD")
+    _nav, _cash, _signed, refreshed_longs, refreshed_shorts, _gross = nav_and_positions(
+        wallet, {p: float(v["LastPrice"]) for p, v in market.items()}, live_shorts
+    )
+
+    if halt_buys:
+        return events
+
+    # Build target exposure only after the opposite side has been reduced to zero.
+    for pair in pairs:
+        target_weight = targets.get(pair, 0.0)
+        if target_weight == 0:
+            continue
+        price = float(market.get(pair, {}).get("LastPrice", 0))
+        if price <= 0:
+            continue
+        target_value = abs(target_weight) * nav
+        minimum = max(cfg["min_trade_usd"], float(pair_info.get(pair, {}).get("MiniOrder", 1.0) or 1.0))
+        precision = int(pair_info.get(pair, {}).get("AmountPrecision", 6))
+
+        if target_weight > 0:
+            if pair in refreshed_shorts:
+                LOG.warning("Skipping long add for %s because its short did not close", pair)
+                continue
+            delta = target_value - refreshed_longs.get(pair, 0.0)
+            if delta < minimum or cash_free <= 0:
+                continue
+            affordable = cash_free / (1.0 + cfg["fee_rate"] + 0.001)
+            spend = min(delta, affordable, cfg["max_order_usd"])
+            quantity = floor_quantity(spend / price, precision)
+            if quantity <= 0 or float(quantity) * price < float(pair_info.get(pair, {}).get("MiniOrder", 1.0) or 1.0):
+                continue
+            event = execute_order(cfg, client, pair, "BUY", quantity, {"nav": nav, "reason": "target_increase"})
+            events.append(event)
+            if not event.get("success"):
                 return events
-    if buys:
-        try:
-            wallet = current_wallet(client)
-        except RoostooAPIError as exc:
-            LOG.error("Could not refresh wallet before buys; stopping this rebalance: %s", exc)
-            return events
-        cash_free, _ = wallet_amount(wallet, "USD")
-    for pair, side, value, price in buys:
-        if halt_buys or cash_free <= 0:
-            break
-        coin = pair.split("/")[0]
-        precision = int(pair_info.get(pair, {}).get("AmountPrecision", 6))
-        affordable = cash_free / (1.0 + cfg["fee_rate"] + 0.001)
-        spend = min(value, affordable, cfg["max_order_usd"])
-        quantity = floor_quantity(spend / price, precision)
-        if quantity <= 0 or float(quantity) * price < float(pair_info.get(pair, {}).get("MiniOrder", 1.0) or 1.0):
-            continue
-        event = execute_order(cfg, client, pair, side, quantity, {"nav": nav, "reason": "target_increase"})
-        events.append(event)
-        if not event.get("success"):
-            LOG.error("Stopping rebalance after an unsuccessful/uncertain order")
-            return events
-        if event.get("success") and not cfg["dry_run"]:
-            # Reserve notional plus fee locally; the next cycle reconciles exact balances.
             cash_free = max(0.0, cash_free - float(quantity) * price * (1.0 + cfg["fee_rate"]))
+        else:
+            dust_limit = float(pair_info.get(pair, {}).get("MiniOrder", 1.0) or 1.0)
+            if refreshed_longs.get(pair, 0.0) > dust_limit:
+                LOG.warning("Skipping short add for %s because its long did not close", pair)
+                continue
+            current_short = refreshed_shorts.get(pair)
+            current_value = float(current_short.get("Notional", 0) or 0) if current_short else 0.0
+            collateral = min(target_value - current_value, cfg["max_order_usd"], cash_free / (1.0 + cfg["fee_rate"] + 0.001))
+            if collateral < minimum:
+                continue
+            event = execute_short_open(cfg, client, pair, collateral, {"nav": nav, "reason": "target_increase"})
+            events.append(event)
+            if not event.get("success"):
+                return events
+            cash_free = max(0.0, cash_free - collateral * (1.0 + cfg["fee_rate"]))
     return events
 
 
@@ -377,6 +442,75 @@ def execute_order(cfg: dict[str, Any], client: RoostooClient, pair: str, side: s
         return event
 
 
+def execute_short_open(cfg: dict[str, Any], client: RoostooClient, pair: str, collateral: float, context: dict[str, Any]) -> dict[str, Any]:
+    details = {"pair": pair, "action": "SHORT_OPEN", "collateral": round(collateral, 8), "context": context}
+    order_log = cfg["data_dir"] / "logs" / "orders.jsonl"
+    log_event(order_log, {"event": "order_intent", **details})
+    if cfg["dry_run"]:
+        result = {"event": "order_result", "success": True, "dry_run": True, **details}
+        log_event(order_log, result)
+        return result
+    try:
+        response = client.open_short_market(pair, collateral)
+        status = response.get("Status", "OPEN")
+        event = {
+            "event": "order_result",
+            "success": status == "OPEN",
+            **details,
+            "position_id": response.get("ID"),
+            "status": status,
+            "entry_price": response.get("EntryPrice"),
+            "short_quantity": response.get("ShortQty"),
+            "open_fee": response.get("OpenFee", 0),
+        }
+        LOG.info("Short open response: pair=%s id=%s status=%s", pair, event["position_id"], status)
+        log_event(order_log, event)
+        return event
+    except RoostooAPIError as exc:
+        LOG.error("Short open failed or has uncertain status: %s", exc)
+        event = {"event": "order_result", "success": False, "error": str(exc), **details}
+        log_event(order_log, event)
+        return event
+
+
+def execute_short_close(
+    cfg: dict[str, Any], client: RoostooClient, pair: str, close_quantity: Any, context: dict[str, Any],
+) -> dict[str, Any]:
+    details = {
+        "pair": pair,
+        "action": "SHORT_CLOSE",
+        "close_quantity": "ALL" if close_quantity is None else format(close_quantity, "f"),
+        "context": context,
+    }
+    order_log = cfg["data_dir"] / "logs" / "orders.jsonl"
+    log_event(order_log, {"event": "order_intent", **details})
+    if cfg["dry_run"]:
+        result = {"event": "order_result", "success": True, "dry_run": True, **details}
+        log_event(order_log, result)
+        return result
+    try:
+        response = client.close_short_market(pair, close_quantity)
+        event = {
+            "event": "order_result",
+            "success": bool(response.get("Success", False)),
+            **details,
+            "close_price": response.get("ClosePrice"),
+            "realized_pnl": response.get("RealizedPNL"),
+            "close_fee": response.get("CloseFee", 0),
+            "closed_quantity": response.get("ClosedQty"),
+            "fully_closed": response.get("FullyClosed"),
+            "remaining_quantity": response.get("RemainingQty", 0),
+        }
+        LOG.info("Short close response: pair=%s qty=%s fully_closed=%s", pair, event["closed_quantity"], event["fully_closed"])
+        log_event(order_log, event)
+        return event
+    except RoostooAPIError as exc:
+        LOG.error("Short close failed or has uncertain status: %s", exc)
+        event = {"event": "order_result", "success": False, "error": str(exc), **details}
+        log_event(order_log, event)
+        return event
+
+
 def run_cycle(cfg: dict[str, Any], state: dict[str, Any], client: RoostooClient, once: bool = False) -> None:
     info_payload = client.exchange_info()
     if info_payload.get("IsRunning") is False:
@@ -391,7 +525,10 @@ def run_cycle(cfg: dict[str, Any], state: dict[str, Any], client: RoostooClient,
     bootstrap_binance(cfg, state, pairs)
     record_prices(state, prices)
     wallet = current_wallet(client)
-    nav, cash_free, positions, gross = nav_and_positions(wallet, {p: v["LastPrice"] for p, v in market.items()})
+    shorts = client.short_positions()
+    nav, cash_free, positions, long_positions, short_map, gross = nav_and_positions(
+        wallet, {p: v["LastPrice"] for p, v in market.items()}, shorts
+    )
     drawdown, daily_return, halt_buys = evaluate_risk(cfg, state, nav)
     if state.get("halted"):
         halt_buys = True
@@ -405,7 +542,7 @@ def run_cycle(cfg: dict[str, Any], state: dict[str, Any], client: RoostooClient,
     diagnostics: dict[str, Any] = {"regime": "warming_up", "signals": {}, "selected": []}
     if do_rebalance:
         changes = {
-            pair: float(item.get("Change", -1.0) or -1.0)
+            pair: float(item.get("Change", 0.0) or 0.0)
             for pair, item in market.items()
         }
         targets, diagnostics = build_targets(
@@ -424,11 +561,14 @@ def run_cycle(cfg: dict[str, Any], state: dict[str, Any], client: RoostooClient,
             LOG.warning("Found %d pending orders; skipping this rebalance", pending_total)
         elif state.get("halted"):
             LOG.error("Risk halt active (%s); liquidating toward cash", state.get("halt_reason", "max drawdown"))
-            rebalance(cfg, state, client, pairs, pair_info, market, wallet, nav, cash_free, positions, {}, True)
+            rebalance(
+                cfg, state, client, pairs, pair_info, market, wallet, nav, cash_free,
+                long_positions, short_map, {}, True,
+            )
         else:
             rebalance(
                 cfg, state, client, pairs, pair_info, market, wallet, nav, cash_free,
-                positions, targets, halt_buys,
+                long_positions, short_map, targets, halt_buys,
             )
         state["last_decision"] = now_iso()
         state["last_regime"] = diagnostics["regime"]
@@ -442,7 +582,7 @@ def run_cycle(cfg: dict[str, Any], state: dict[str, Any], client: RoostooClient,
         "daily_return": round(daily_return, 6), "regime": diagnostics["regime"],
     })
     log_event(cfg["data_dir"] / "logs" / "cycles.jsonl", {
-        "nav": nav, "cash_free": cash_free, "positions": positions, "prices": prices,
+        "nav": nav, "cash_free": cash_free, "positions": positions, "short_positions": short_map, "prices": prices,
         "targets": targets, "regime": diagnostics["regime"], "signals": diagnostics.get("signals", {}), "drawdown": drawdown,
         "daily_return": daily_return, "pending_orders": pending_total,
         "risk_halt": bool(state.get("halted")),
@@ -454,12 +594,16 @@ def show_status(cfg: dict[str, Any], client: RoostooClient) -> None:
     info = client.exchange_info()
     market = make_market_map(client.ticker())
     wallet = current_wallet(client)
-    nav, cash_free, positions, gross = nav_and_positions(wallet, {p: v["LastPrice"] for p, v in market.items()})
+    shorts = client.short_positions()
+    nav, cash_free, positions, _long_positions, short_map, gross = nav_and_positions(
+        wallet, {p: v["LastPrice"] for p, v in market.items()}, shorts
+    )
     print(json.dumps({
         "exchange_running": bool(info.get("IsRunning", True)),
         "nav_usd": round(nav, 2), "free_cash_usd": round(cash_free, 2),
         "gross_exposure_pct": round(gross / nav, 4) if nav else 0,
         "positions_usd": {key: round(value, 2) for key, value in positions.items()},
+        "short_positions": short_map,
     }, indent=2))
 
 
@@ -489,7 +633,8 @@ def main() -> int:
             payload = client.exchange_info()
             LOG.info("Exchange running=%s; tradable pairs=%d", payload.get("IsRunning"), len(exchange_pairs(payload)))
             wallet = current_wallet(client)
-            LOG.info("Signed balance request succeeded; wallet currencies=%d", len(wallet))
+            shorts = client.short_positions()
+            LOG.info("Signed balance and short-position requests succeeded; wallet currencies=%d open_shorts=%d", len(wallet), len(shorts))
             return 0
         if args.status:
             show_status(cfg, client)

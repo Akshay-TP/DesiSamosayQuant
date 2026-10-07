@@ -110,11 +110,30 @@ class RoostooClient:
     def pending_count(self) -> dict[str, Any]:
         return self._get("/v3/pending_count", signed=True)
 
+    def short_positions(self) -> list[dict[str, Any]]:
+        payload = self._get("/v6/short_positions", signed=True)
+        positions = payload.get("Positions", [])
+        if not isinstance(positions, list):
+            raise RoostooAPIError("/v6/short_positions returned an unexpected Positions field")
+        return positions
+
     def place_market_order(self, pair: str, side: str, quantity: Decimal) -> dict[str, Any]:
         return self._post(
             "/v3/place_order",
             {"pair": pair, "side": side.upper(), "type": "MARKET", "quantity": format(quantity, "f")},
         )
+
+    def open_short_market(self, pair: str, collateral: float) -> dict[str, Any]:
+        return self._post(
+            "/v6/short_open",
+            {"pair": pair, "collateral": format(Decimal(str(collateral)), "f")},
+        )
+
+    def close_short_market(self, pair: str, close_quantity: Decimal | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"pair": pair}
+        if close_quantity is not None:
+            params["close_qty"] = format(close_quantity, "f")
+        return self._post("/v6/short_close", params)
 
 
 def floor_quantity(quantity: float, precision: int) -> Decimal:

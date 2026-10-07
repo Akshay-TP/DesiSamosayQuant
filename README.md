@@ -1,16 +1,16 @@
 # DesiSamosayQuant
 
-Autonomous, long-only Roostoo competition bot. It uses a four-hour rebalance schedule and a price-only trend strategy, with a persistent audit trail for decisions and orders.
+Autonomous Roostoo competition bot for 1× long and short spot exposure. It uses a four-hour rebalance schedule and a price-only trend strategy, with a persistent audit trail for decisions and orders.
 
 ## Strategy
 
-The bot ranks the configured Roostoo USD pairs by a risk-adjusted blend of 24-hour and 72-hour momentum. It only holds assets with positive short-term momentum and price above their 24-hour exponential moving average. BTC below its 72-hour EMA reduces the portfolio exposure cap. The bot allocates to at most four leaders, caps each asset at 25% of NAV, and holds the remaining portfolio in USD.
+The bot ranks configured Roostoo USD pairs by a risk-adjusted blend of 24-hour and 72-hour momentum. It buys assets with positive momentum above their 24-hour EMA and opens shorts on assets with negative momentum below that EMA. BTC's 72-hour trend shifts the budget toward longs in a risk-on regime or shorts in a risk-off regime. Combined long plus short gross exposure is capped at 75% of NAV, with at most 25% per asset; unused capital stays in USD. During cold start, total exposure is capped at 25%.
 
 Live Roostoo ticker responses do not provide OHLCV history or volume. By default, free public Binance hourly closes seed the initial price history; after startup, all new signal observations come from Roostoo. Set `BOOTSTRAP_BINANCE=false` to disable that source. If seeding is unavailable, the bot can start conservatively from Roostoo's 24-hour `Change` field, limits exposure to 25%, and switches to the full multi-horizon model after it collects 73 hourly prices.
 
-The bot uses only spot market orders. It does not short, use leverage, make markets, arbitrage, or submit rapid orders. It checks the account once per hour and rebalances at most once every four hours. It accounts for the competition's 0.1% taker fee when sizing buys. Exchange order precision and minimums are read from `exchangeInfo`.
+The bot uses spot market orders and Roostoo's `/v6/short_open`, `/v6/short_close`, and `/v6/short_positions` endpoints. Short collateral is sized 1:1 with position notional; there is no leverage. It does not make markets, arbitrage, or submit rapid orders. It checks the account once per hour and rebalances at most once every four hours. Longs and shorts are reduced or closed before opposite-side exposure is opened. The bot accounts for the competition's 0.1% taker fee, including short open/close fees. Exchange order precision and minimums are read from `exchangeInfo`.
 
-Risk controls include a 75% maximum gross exposure, 25% maximum per asset, a 4% daily loss gate, and a persistent 8% peak-to-trough drawdown halt that sells toward cash. These are configurable in `.env`.
+Risk controls include a 75% maximum combined gross exposure, 25% maximum per asset, a 4% daily loss gate, and a persistent 8% peak-to-trough drawdown halt that closes longs and shorts toward cash. These are configurable in `.env`.
 
 ## Setup
 
@@ -57,7 +57,7 @@ If a market-order POST times out, its status is uncertain. The client deliberate
 The ignored `runtime/` directory is created at first run:
 
 - `state.json` stores hourly prices and risk state across restarts.
-- `portfolio.csv` records NAV, cash, exposure, and daily/peak drawdown.
+- `portfolio.csv` records NAV, cash, combined gross exposure, and daily/peak drawdown.
 - `logs/cycles.jsonl` records every decision cycle and its targets.
 - `logs/orders.jsonl` records order requests and exchange responses.
 - `logs/bot.log` contains operational logs.
@@ -70,7 +70,11 @@ On the competition-provided EC2 instance, clone this repository, install Python 
 
 ## Competition context
 
-The current APAC event page specifies autonomous trading, open-source code review, traceable strategy commits, no HFT/market making/arbitrage, and spot trading with 1x long/short allowed. This implementation chooses long-only spot. The page states 0.1% taker and 0.05% maker fees; the bot uses market orders and the 0.1% taker assumption. Recheck event updates and actual account configuration before deployment.
+The current APAC event page specifies autonomous trading, open-source code review, traceable strategy commits, no HFT/market making/arbitrage, and spot trading with 1× long/short allowed. It also requires at least 8 active trading days with enough strategy trades each day. The bot rebalances at most every four hours and never forces trades to inflate activity; that means the strategy and live market conditions must still produce enough actual fills. Use `python audit_competition.py` to review successful live order actions by UTC day. The organizers' public page does not define the numeric meaning of “enough trades,” so confirm that threshold with them.
+
+The event page lists the live period as Oct 4–17, 2026, and the open-source repository submission deadline as before Oct 14. Keep each strategy change in a descriptive Git commit and run the bot autonomously; do not manually call trading endpoints on the competition account. `--check` and `--status` are read-only. Do not publish `.env` or runtime credentials. See [COMPETITION_RULES.md](COMPETITION_RULES.md) for the verified rule summary and outstanding details.
+
+The event page states 0.1% taker and 0.05% maker fees; this bot uses market orders and the 0.1% taker assumption. Roostoo's short API also documents 0.1% fees on opening and closing short positions. It uses Binance public hourly candles only to seed initial price history; the event page permits external data sources. Recheck event updates and actual account permissions before deployment.
 
 ## References
 
